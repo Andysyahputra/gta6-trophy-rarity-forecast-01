@@ -12,7 +12,11 @@ For each case we
   3. per trophy, recover earners (rate * players / 100) at each snapshot and
      fit log earners against log time since release, shrinking each trophy's
      slope toward the median slope of its tier (platinum / gold / silver /
-     bronze) so noisy rare trophies borrow strength from their tier;
+     bronze) so noisy rare trophies borrow strength from their tier.  Both
+     fits weight recent snapshots more (24-hour half-life), so the launch-night
+     regime does not steer the extrapolation, and the log-earners fit adds a
+     half-earner continuity offset that is subtracted back when forecasting,
+     so small earner counts are not biased upward;
   4. forecast the rate as forecast earners / forecast players, and spread the
      five quantiles on the logit scale with a sigma that grows with the
      horizon and with the slope fit's own uncertainty.
@@ -86,25 +90,79 @@ def round4(x):
     return int(scaled) if float(scaled).is_integer() else scaled
 
 
-def ols(xs, ys):
-    """Least squares y ~ a + b*x. Returns (a, b, se_b, n); se_b is 0 when the
-    fit is exact, degenerate, or has too few points to judge."""
+def solve3(mat, vec):
+    """Solve a 3x3 linear system by Gaussian elimination; None if singular."""
+    rows = [row[:] + [v] for row, v in zip(mat, vec)]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(rows[r][col]))
+        if abs(rows[piv][col]) < 1e-12:
+            return None
+        rows[col], rows[piv] = rows[piv], rows[col]
+        for r in range(col + 1, 3):
+            f = rows[r][col] / rows[col][col]
+            for c in range(col, 4):
+                rows[r][c] -= f * rows[col][c]
+    out = [0.0, 0.0, 0.0]
+    for r in (2, 1, 0):
+        s = rows[r][3] - sum(rows[r][c] * out[c] for c in range(r + 1, 3))
+        out[r] = s / rows[r][r]
+    return out
+
+
+def quad_fit(xs, ys, ws):
+    """Weighted fit y ~ a + b*x + c*x^2. Returns (a, b, c) with c <= 0, or
+    None when there are too few points, the system is singular, or the
+    fitted curve is not concave (then the linear fit stands)."""
+    if len(xs) < 5:
+        return None
+    sw = sum(ws)
+    mx = sum(w * x for w, x in zip(ws, xs)) / sw
+    # Centre x for numerical stability; the returned a is at the centre.
+    xc = [x - mx for x in xs]
+    s = [0.0] * 5
+    t = [0.0] * 3
+    for x, y, w in zip(xc, ys, ws):
+        p = 1.0
+        for k in range(5):
+            s[k] += w * p
+            p *= x
+        p = 1.0
+        for k in range(3):
+            t[k] += w * p * y
+            p *= x
+    mat = [[s[0], s[1], s[2]], [s[1], s[2], s[3]], [s[2], s[3], s[4]]]
+    sol = solve3(mat, t)
+    if sol is None:
+        return None
+    a, b, c = sol
+    if c > 0:
+        return None
+    return (a, b, c, mx)
+
+
+def ols(xs, ys, ws=None):
+    """Least squares y ~ a + b*x, optionally recency-weighted. Returns
+    (a, b, se_b, n); se_b is 0 when the fit is exact, degenerate, or has too
+    few points to judge. Weights default to 1."""
     n = len(xs)
     if n == 0:
         return (0.0, 0.0, 0.0, 0)
+    if ws is None:
+        ws = [1.0] * n
     if n == 1:
         return (ys[0], 0.0, 0.0, 1)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
+    sw = sum(ws)
+    mx = sum(w * x for w, x in zip(ws, xs)) / sw
+    my = sum(w * y for w, y in zip(ws, ys)) / sw
+    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs))
     if sxx <= 0:
         return (my, 0.0, 0.0, n)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxy = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys))
     b = sxy / sxx
     a = my - b * mx
     se_b = 0.0
     if n > 2:
-        resid2 = sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys))
+        resid2 = sum(w * (y - (a + b * x)) ** 2 for w, x, y in zip(ws, xs, ys))
         dof = n - 2
         if resid2 > 0:
             se_b = math.sqrt((resid2 / dof) / sxx)
@@ -162,10 +220,16 @@ def forecast_case(case, name):
 
     xs = [log_time(at) for at, _, _ in snaps]
     x_last = xs[-1]
+    # Recency weights: a snapshot a day old counts half as much as the last
+    # one, so the fit follows the current regime, not launch night.
+    times = [at for at, _, _ in snaps]
+    last_time = times[-1]
+    weights = [0.5 ** ((last_time - at).total_seconds() / 86400.0)
+               for at in times]
 
     # --- players-tracked growth -------------------------------------------
     log_players = [math.log(p) for _, p, _ in snaps]
-    a_p, b_p, _, _ = ols(xs, log_players)
+    a_p, b_p, _, _ = ols(xs, log_players, weights)
     players_star = math.exp(a_p + b_p * x_target)
     players_star = max(players_star, snaps[-1][1])
 
@@ -174,16 +238,17 @@ def forecast_case(case, name):
     # after shrinkage), to find each tier's median slope.
     series = []
     for i, trophy in enumerate(trophies):
-        ex, ey = [], []
-        for (at, players, rates), x in zip(snaps, xs):
+        ex, ey, ew = [], [], []
+        for (at, players, rates), x, w in zip(snaps, xs, weights):
             rate = rates[i] if i < len(rates) else None
             if rate is None:
                 continue
             earners = rate * players / 100.0
             ex.append(x)
             ey.append(math.log(earners + 0.5))
-        series.append((ex, ey))
-    raw = [ols(ex, ey) for ex, ey in series]
+            ew.append(w)
+        series.append((ex, ey, ew))
+    raw = [ols(ex, ey, ew) for ex, ey, ew in series]
     tier_slopes = {}
     for tier in ("platinum", "gold", "silver", "bronze"):
         slopes = [raw[i][1] for i, t in enumerate(trophies)
@@ -202,16 +267,29 @@ def forecast_case(case, name):
         # never moved keeps a slope near its tier's, not exactly zero.
         b_shrunk = (n_i * b_i + SHRINK_PRIOR * prior) / (n_i + SHRINK_PRIOR)
         # Re-anchor the intercept so the shrunk line still passes through
-        # the fit's centre (mean x, mean y of this trophy's points).
-        ex, ey = series[i]
+        # the fit's centre (weighted mean x, weighted mean y of this
+        # trophy's points).
+        ex, ey, ew = series[i]
         if ex:
-            mx = sum(ex) / len(ex)
-            my = sum(ey) / len(ey)
+            sw = sum(ew)
+            mx = sum(w * x for w, x in zip(ew, ex)) / sw
+            my = sum(w * y for w, y in zip(ew, ey)) / sw
             a_shrunk = my - b_shrunk * mx
         else:
             a_shrunk = math.log(0.5)
-        earners_star = math.exp(a_shrunk + b_shrunk * x_target)
+        # Undo the half-earner continuity offset: the fit was on
+        # log(earners + 0.5), so the forecast earners are exp(...) - 0.5.
+        earners_star = math.exp(a_shrunk + b_shrunk * x_target) - 0.5
         earners_star = min(max(earners_star, 0.0), players_star)
+        # Earners growth decelerates as a trophy's cohort saturates, so a
+        # concave quadratic in log time may damp the linear extrapolation,
+        # never raise it.
+        quad = quad_fit(ex, ey, ew)
+        if quad is not None:
+            qa, qb, qc, qmx = quad
+            dxq = x_target - qmx
+            earners_quad = math.exp(qa + qb * dxq + qc * dxq * dxq) - 0.5
+            earners_star = min(earners_star, max(earners_quad, 0.0))
         rate_star = 100.0 * earners_star / players_star if players_star else 0.01
 
         # Spread: floor + horizon growth + slope uncertainty over the
